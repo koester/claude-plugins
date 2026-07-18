@@ -13,7 +13,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
@@ -86,6 +86,36 @@ function saveConfig(cfg) {
 // beats whatever stale ELEVENLABS_API_KEY might be lingering in the shell/process).
 function apiKey(cfg) {
   return cfg?.apiKey || process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY || '';
+}
+
+// Is the OS audio output muted? Returns true/false, or null when unknown (non-macOS / no answer).
+// Cached ~3s so a frequently-rendered status line doesn't spawn osascript on every draw.
+function systemMuted() {
+  if (process.platform !== 'darwin') return null;
+  const cachePath = path.join(DIR, '.mute-cache');
+  try {
+    const [ts, val] = fs.readFileSync(cachePath, 'utf8').split('\n');
+    if (Date.now() - Number(ts) < 3000) return val === 'true';
+  } catch {
+    /* no/expired cache */
+  }
+  let muted = null;
+  try {
+    const r = spawnSync('osascript', ['-e', 'output muted of (get volume settings)'], {
+      encoding: 'utf8',
+      timeout: 1000,
+    });
+    if (r.status === 0) muted = r.stdout.trim() === 'true';
+  } catch {
+    /* leave null */
+  }
+  try {
+    ensureDir();
+    fs.writeFileSync(cachePath, `${Date.now()}\n${muted}`);
+  } catch {
+    /* best-effort */
+  }
+  return muted;
 }
 
 // ---------- transcript extraction + speech cleanup ----------
@@ -726,6 +756,23 @@ async function runCli(argv) {
       } else {
         console.log(`current speed: ${cfg.speed} (allowed range 0.5–2.0)`);
       }
+      break;
+    }
+    case 'statusline': {
+      // Compact segment for a Claude Code status line: enabled state + a system-mute warning.
+      // No trailing newline; honors CLAUDER_ASCII (icons→text) and NO_COLOR.
+      const ascii = process.env.CLAUDER_ASCII === '1';
+      const paint = (s, c) => (process.env.NO_COLOR ? s : `\x1b[${c}m${s}\x1b[0m`);
+      let seg;
+      if (cfg.enabled === false) {
+        seg = paint(ascii ? 'yapper off' : '🔇 yapper off', '2'); // dim
+      } else if (systemMuted() === true) {
+        // The important one: yapper is on but the system is muted, so you'd hear nothing.
+        seg = paint(ascii ? 'yapper MUTED' : '🔇 yapper muted', '38;5;167'); // red
+      } else {
+        seg = paint(ascii ? 'yapper on' : '🔊 yapper', '38;5;114'); // green
+      }
+      process.stdout.write(seg);
       break;
     }
     default:

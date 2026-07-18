@@ -87,6 +87,28 @@ key can't be bound directly to "stop yapper." Use one of these instead:
 
   It targets the stable pid file, so it keeps working across plugin updates.
 
+## Status line
+
+`yapper statusline` prints a compact segment for a Claude Code status line so you can see, at a
+glance, whether yapper is on — and **whether your system audio is muted** (the #1 reason you'd hear
+nothing). Output has no trailing newline and honors `NO_COLOR` and `CLAUDER_ASCII=1`:
+
+- `🔊 yapper` — enabled, audio audible
+- `🔇 yapper muted` (red) — enabled, but the **system output is muted**
+- `🔇 yapper off` (dim) — disabled
+
+**No existing status line?** Point Claude Code straight at it in `settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "node /path/to/yapper/scripts/yapper.mjs statusline" }
+```
+
+**Already have a status line?** Wrap it so both render — run your existing command, then append
+yapper's segment. See [`examples/statusline-wrapper.sh`](./examples/statusline-wrapper.sh) for a
+drop-in wrapper (it locates the installed yapper script itself), then set
+`statusLine.command` to the wrapper. The wrapper keeps working across yapper and base-status-line
+updates.
+
 ## Configuration
 
 Settings persist to `~/.claude/yapper/config.json` (outside the plugin dir, so they survive
