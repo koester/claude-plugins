@@ -21,6 +21,12 @@ const DIR = path.join(HOME, '.claude', 'yapper');
 const CONFIG_PATH = path.join(DIR, 'config.json');
 const PID_PATH = path.join(DIR, 'current.pid');
 const LOG_PATH = path.join(DIR, 'yapper.log');
+// Rolling buffer of the current turn's displayed assistant text, fed by the MessageDisplay hook so
+// a following AskUserQuestion prompt can be read together with the text that preceded it.
+const BUFFER_PATH = path.join(DIR, 'preamble-buffer.txt');
+// The latest read wins: every new read stamps a fresh epoch here; a worker whose epoch is stale
+// bows out before its next chunk, so reads never overlap or play out of order.
+const EPOCH_PATH = path.join(DIR, 'epoch');
 
 // Config lives outside the plugin directory so it survives plugin updates.
 const DEFAULTS = {
@@ -39,8 +45,10 @@ const DEFAULTS = {
   stopOnPrompt: true, // stop any playing audio the moment you submit your next prompt
   readOptions: true, // read AskUserQuestion prompts (question + options) aloud — Stop won't fire for those
   readOptionDescriptions: true, // include each option's description, not only its label
+  readPreamble: true, // read the assistant text shown before a prompt (captured via MessageDisplay)
   skipCodeBlocks: true, // drop fenced code blocks entirely (reading code aloud is useless)
   outputFormat: 'mp3_44100_128',
+  chunkChars: 2000, // max characters per TTS request/audio segment (keeps well under API limits)
   playerCmd: null, // override the audio player; default: afplay on macOS, ffplay elsewhere
   playerArgs: null,
   apiKey: '', // optional: store the ElevenLabs key here if you don't export it as an env var
@@ -260,7 +268,7 @@ async function resolveVoiceId(cfg, key) {
   return voices[0].id;
 }
 
-async function synthesizeAndPlay(text, cfg) {
+async function synthesizeAndPlay(text, cfg, epoch) {
   const key = apiKey(cfg);
   if (!key) {
     log('no API key — set ELEVENLABS_API_KEY or add "apiKey" to the config');
@@ -277,54 +285,65 @@ async function synthesizeAndPlay(text, cfg) {
     return;
   }
 
-  let audio;
-  try {
-    audio = await synthesize(text, cfg, key, voiceId);
-  } catch (e) {
-    if (e.status === 402) {
-      log(
-        `voice ${voiceId} needs a paid ElevenLabs plan — library/cloned voices require a paid ` +
-          `subscription. Pick a free premade voice with "yapper voices" (e.g. Brian), or upgrade.`,
-      );
-      return;
-    }
-    const voiceError = [400, 404, 422].includes(e.status);
-    if (voiceError && explicitVoice) {
-      // Don't silently swap a voice the user chose on purpose — tell them how to fix it.
-      log(
-        `TTS failed for voice ${voiceId} (${e.status}). If it's a Voice Library voice, add it to ` +
-          `your account first (elevenlabs.io → Voice Library → "Add to My Voices"), then retry.`,
-      );
-      return;
-    }
-    if (voiceError) {
-      // The auto-picked voice went stale — refetch the first available and retry once.
-      try {
-        const voices = await fetchVoices(key);
-        if (!voices.length) throw e;
-        voiceId = voices[0].id;
-        const saved = loadConfig();
-        saved.voiceId = voiceId;
-        saveConfig(saved);
-        audio = await synthesize(text, cfg, key, voiceId);
-      } catch (e2) {
-        log(`TTS failed after voice retry: ${e2.message}`);
+  // If a newer read has started, this one is stale — stop so reads never overlap or misorder.
+  const superseded = () => epoch && currentEpoch() !== epoch;
+  const chunks = chunkText(text, Math.max(200, cfg.chunkChars || 2000));
+
+  for (const chunk of chunks) {
+    if (superseded()) return;
+
+    let audio;
+    try {
+      audio = await synthesize(chunk, cfg, key, voiceId);
+    } catch (e) {
+      if (e.status === 402) {
+        log(
+          `voice ${voiceId} needs a paid ElevenLabs plan — library/cloned voices require a paid ` +
+            `subscription. Pick a free premade voice with "yapper voices" (e.g. Brian), or upgrade.`,
+        );
         return;
       }
-    } else {
-      log(`TTS failed: ${e.message}`);
+      const voiceError = [400, 404, 422].includes(e.status);
+      if (voiceError && !explicitVoice) {
+        // The auto-picked voice went stale — refetch the first available and retry this chunk once.
+        try {
+          const voices = await fetchVoices(key);
+          if (!voices.length) throw e;
+          voiceId = voices[0].id;
+          const saved = loadConfig();
+          saved.voiceId = voiceId;
+          saveConfig(saved);
+          audio = await synthesize(chunk, cfg, key, voiceId);
+        } catch (e2) {
+          log(`TTS failed after voice retry: ${e2.message}`);
+          return;
+        }
+      } else if (voiceError) {
+        // Don't silently swap a voice the user chose on purpose — tell them how to fix it.
+        log(
+          `TTS failed for voice ${voiceId} (${e.status}). If it's a Voice Library voice, add it to ` +
+            `your account first (elevenlabs.io → Voice Library → "Add to My Voices"), then retry.`,
+        );
+        return;
+      } else {
+        log(`TTS failed: ${e.message}`);
+        return;
+      }
+    }
+
+    if (superseded()) return; // a newer read arrived during synthesis — don't play this chunk
+    const tmp = path.join(
+      os.tmpdir(),
+      `yapper-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp3`,
+    );
+    try {
+      fs.writeFileSync(tmp, audio);
+    } catch (e) {
+      log(`write audio failed: ${e.message}`);
       return;
     }
+    await play(tmp, cfg);
   }
-
-  const tmp = path.join(os.tmpdir(), `yapper-${process.pid}-${Date.now()}.mp3`);
-  try {
-    fs.writeFileSync(tmp, audio);
-  } catch (e) {
-    log(`write audio failed: ${e.message}`);
-    return;
-  }
-  await play(tmp, cfg);
 }
 
 // ---------- stdin ----------
@@ -364,18 +383,86 @@ async function runHook() {
   const text = cleanForSpeech(raw, cfg);
   if (!text || text.length < 2) return;
 
-  if (cfg.interrupt) killCurrent();
-  stageAndSpawn(text);
+  stageAndSpawn(text, cfg);
+}
+
+// ---------- preamble buffer (fed by MessageDisplay, consumed by the AskUserQuestion hook) ----------
+
+function appendPreamble(delta) {
+  try {
+    ensureDir();
+    fs.appendFileSync(BUFFER_PATH, delta);
+  } catch {
+    /* best-effort */
+  }
+}
+
+function readPreambleBuffer() {
+  try {
+    return fs.readFileSync(BUFFER_PATH, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function clearPreambleBuffer() {
+  try {
+    fs.unlinkSync(BUFFER_PATH);
+  } catch {
+    /* already gone */
+  }
+}
+
+// ---------- read ordering (epoch) + chunking ----------
+
+// Stamp a new "latest read" token. Older workers see a different value and stop.
+function bumpEpoch() {
+  const e = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    ensureDir();
+    fs.writeFileSync(EPOCH_PATH, e);
+  } catch {
+    /* best-effort */
+  }
+  return e;
+}
+
+function currentEpoch() {
+  try {
+    return fs.readFileSync(EPOCH_PATH, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+// Split long text into API-safe pieces at sentence (then word) boundaries, preserving order.
+function chunkText(text, limit) {
+  const t = text.trim();
+  if (!t) return [];
+  if (t.length <= limit) return [t];
+  const chunks = [];
+  let rest = t;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('. ', limit);
+    if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit); // no sentence break → word break
+    if (cut <= 0) cut = limit; // no break at all → hard cut
+    chunks.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks;
 }
 
 // Hand text to a detached worker and return immediately so the hook never blocks the session.
-function stageAndSpawn(text) {
+function stageAndSpawn(text, cfg) {
   // Debug aid: YAPPER_DRY=1 prints the would-be-spoken text to stderr and skips audio.
   if (process.env.YAPPER_DRY) {
     process.stderr.write(`[yapper dry] ${text}\n`);
     return;
   }
   ensureDir();
+  const epoch = bumpEpoch(); // mark this as the latest read so any in-flight worker bows out
+  if (!cfg || cfg.interrupt !== false) killCurrent(); // silence the previous read immediately
   const textFile = path.join(DIR, `pending-${process.pid}-${Date.now()}.txt`);
   try {
     fs.writeFileSync(textFile, text);
@@ -383,10 +470,11 @@ function stageAndSpawn(text) {
     log(`could not stage text: ${e.message}`);
     return;
   }
-  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--worker', textFile], {
-    detached: true,
-    stdio: 'ignore',
-  });
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(import.meta.url), '--worker', textFile, epoch],
+    { detached: true, stdio: 'ignore' },
+  );
   child.unref();
 }
 
@@ -404,20 +492,31 @@ async function runTool() {
   }
   if (payload?.tool_name !== 'AskUserQuestion') return;
 
-  // Only the question + options are available at PreToolUse. The assistant's preamble text isn't
-  // persisted anywhere a hook can read until AFTER the prompt is answered, so it can't be spoken
-  // alongside the prompt — it stays on screen to read.
-  const spoken = textFromAskUserQuestion(payload.tool_input, cfg);
-  if (!spoken) return;
+  let spoken = textFromAskUserQuestion(payload.tool_input, cfg);
+  if (!spoken) {
+    clearPreambleBuffer();
+    return;
+  }
+
+  // Prepend the assistant text shown just before the prompt — captured live by the MessageDisplay
+  // hook (it isn't in the PreToolUse payload or the transcript yet). Cap the preamble so a long one
+  // doesn't crowd out the options.
+  if (cfg.readPreamble !== false) {
+    const pre = cleanForSpeech(readPreambleBuffer(), cfg);
+    if (pre) {
+      const cap = Math.max(200, (cfg.maxChars || 1000) - 300);
+      spoken = `${pre.length > cap ? pre.slice(0, cap) : pre} ${spoken}`;
+    }
+  }
+  clearPreambleBuffer();
 
   const text = cleanForSpeech(spoken, cfg);
   if (!text || text.length < 2) return;
 
-  if (cfg.interrupt) killCurrent();
-  stageAndSpawn(text);
+  stageAndSpawn(text, cfg);
 }
 
-async function runWorker(textFile) {
+async function runWorker(textFile, epoch) {
   const cfg = loadConfig();
   let text = '';
   try {
@@ -430,7 +529,7 @@ async function runWorker(textFile) {
   } catch {
     /* ignore */
   }
-  if (text) await synthesizeAndPlay(text, cfg);
+  if (text) await synthesizeAndPlay(text, cfg, epoch);
 }
 
 async function runCli(argv) {
@@ -614,19 +713,36 @@ async function runCli(argv) {
 
 const argv = process.argv.slice(2);
 if (argv[0] === '--hook') {
-  runHook().catch((e) => log(`hook error: ${e.message}`));
+  // Stop = turn ended; clear the preamble buffer so it never leaks into the next turn.
+  runHook()
+    .catch((e) => log(`hook error: ${e.message}`))
+    .finally(() => clearPreambleBuffer());
 } else if (argv[0] === '--worker') {
-  runWorker(argv[1]).catch((e) => log(`worker error: ${e.message}`));
+  runWorker(argv[1], argv[2]).catch((e) => log(`worker error: ${e.message}`));
 } else if (argv[0] === '--tool') {
   runTool().catch((e) => log(`tool hook error: ${e.message}`));
 } else if (argv[0] === '--interrupt') {
-  // UserPromptSubmit hook: silence playback the instant the user starts their next turn.
+  // UserPromptSubmit hook: silence playback and start a fresh preamble buffer for the new turn.
   // Must write NOTHING to stdout — UserPromptSubmit stdout is injected into the prompt.
   try {
     if (loadConfig().stopOnPrompt !== false) killCurrent();
+    clearPreambleBuffer();
   } catch (e) {
     log(`interrupt error: ${e.message}`);
   }
+} else if (argv[0] === '--capture') {
+  // MessageDisplay hook: accumulate the assistant's displayed text (payload.delta) so the next
+  // AskUserQuestion prompt can be read together with it. Silent; writes only to the buffer file.
+  readStdin().then((raw) => {
+    try {
+      const cfg = loadConfig();
+      if (!cfg.enabled || cfg.readOptions === false || cfg.readPreamble === false) return;
+      const p = JSON.parse(raw);
+      if (typeof p?.delta === 'string' && p.delta) appendPreamble(p.delta);
+    } catch {
+      /* best-effort */
+    }
+  });
 } else {
   runCli(argv).catch((e) => {
     console.error(e.message);

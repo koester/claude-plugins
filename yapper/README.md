@@ -105,8 +105,10 @@ plugin updates). Defaults:
   "stopOnPrompt": true,
   "readOptions": true,
   "readOptionDescriptions": true,
+  "readPreamble": true,
   "skipCodeBlocks": true,
   "outputFormat": "mp3_44100_128",
+  "chunkChars": 2000,
   "playerCmd": null,
   "playerArgs": null,
   "apiKey": ""
@@ -126,26 +128,40 @@ plugin updates). Defaults:
   `AskUserQuestion` — the "pick an option" prompts). The `Stop` hook can't cover these because the
   turn is still mid-tool, so a `PreToolUse` hook reads the question and its options as they appear.
   - **`readOptionDescriptions`** — include each option's description, not only its label.
-  - *Note:* only the question and options are read — the assistant's text shown **just before** a
-    prompt can't be. Claude Code doesn't persist that text anywhere a hook can reach until after the
-    prompt is answered (verified), so at prompt time there's no source for it; it stays on screen.
+  - **`readPreamble`** — also read the assistant text shown **just before** the prompt. That text
+    isn't in the `PreToolUse` payload or the transcript at prompt time, so a `MessageDisplay` hook
+    captures it live as it streams and the prompt read is prefixed with it — important for planning
+    flows where the questions make no sense without the context. A long preamble is capped so it
+    doesn't crowd out the options.
 - **`skipCodeBlocks`** — drops fenced code blocks entirely (reading code aloud is useless).
+- **`chunkChars`** — long reads are split into pieces of at most this many characters (default
+  2000) at sentence boundaries and played in order, staying well under the ElevenLabs per-request
+  limits (~40k chars / ~40 min). Also lets you raise `maxChars` for long planning-context reads.
 - **`playerCmd` / `playerArgs`** — override the audio player, e.g. `"playerCmd": "mpg123"`,
   `"playerArgs": ["-q"]`.
 
 ## How it works
 
-`hooks/hooks.json` registers three hooks, all pointing at `scripts/yapper.mjs`:
+`hooks/hooks.json` registers four hooks, all pointing at `scripts/yapper.mjs`:
 
 - **`Stop`** → `--hook` — the main path: reads the hook payload from stdin (uses
   `last_assistant_message` if present, otherwise the last assistant text block from the transcript
   JSONL), strips markdown, then spawns a **detached worker** and exits immediately (never blocks).
 - **`PreToolUse`** (matcher `AskUserQuestion`) → `--tool` — `Stop` doesn't fire while a question
-  prompt is on screen (the turn is mid-tool), so this reads the question and its options from the
-  tool input. Stays silent on stdout so it can't affect the prompt.
-- **`UserPromptSubmit`** → `--interrupt` — stops playback the moment you submit your next prompt.
+  prompt is on screen (the turn is mid-tool), so this reads the question and its options (plus the
+  captured preamble, see below). Stays silent on stdout so it can't affect the prompt.
+- **`MessageDisplay`** → `--capture` — fires per displayed text chunk with a `delta` field;
+  accumulates the turn's assistant text into a buffer so the `PreToolUse` read can prefix it as the
+  preamble. Writes only to the buffer file; never speaks.
+- **`UserPromptSubmit`** → `--interrupt` — stops playback and resets the preamble buffer when you
+  submit your next prompt.
 - The worker (`--worker`) calls the ElevenLabs `text-to-speech` endpoint, writes an MP3 to a
-  temp file, and plays it. It records the player PID so the next response can interrupt it.
+  temp file, and plays it, recording the player PID so a new read can interrupt it.
+
+**One read at a time, in order.** Every read stamps an *epoch*; a worker whose epoch is no longer
+current stops before its next chunk, so `Stop` and `PreToolUse` reads never overlap or play out of
+order — the latest read always wins. Long text is split at sentence boundaries into `chunkChars`
+pieces and played sequentially, keeping each request under the ElevenLabs limits.
 - All failures are **soft**: missing/invalid key, network errors, or no audio player are logged
   to `~/.claude/yapper/yapper.log` and the hook still exits 0. Yapper never breaks your session.
 
