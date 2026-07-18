@@ -39,7 +39,6 @@ const DEFAULTS = {
   stopOnPrompt: true, // stop any playing audio the moment you submit your next prompt
   readOptions: true, // read AskUserQuestion prompts (question + options) aloud — Stop won't fire for those
   readOptionDescriptions: true, // include each option's description, not only its label
-  readPreamble: true, // also read the assistant text shown just before the prompt
   skipCodeBlocks: true, // drop fenced code blocks entirely (reading code aloud is useless)
   outputFormat: 'mp3_44100_128',
   playerCmd: null, // override the audio player; default: afplay on macOS, ffplay elsewhere
@@ -108,37 +107,6 @@ function extractLastAssistantText(transcriptPath) {
     const texts = content.filter((b) => b?.type === 'text' && b.text).map((b) => b.text);
     if (texts.length) return texts.join('\n\n');
     // assistant line with only tool_use/thinking → keep looking further back in the turn
-  }
-  return '';
-}
-
-// Walk the transcript backwards for the assistant text of the CURRENT turn only — the text shown
-// just before a tool call. Stops at the human-message boundary so it never reaches a prior turn
-// (returns '' when the assistant called the tool with no preceding text).
-function currentTurnPreamble(transcriptPath) {
-  let data;
-  try {
-    data = fs.readFileSync(transcriptPath, 'utf8');
-  } catch {
-    return '';
-  }
-  const lines = data.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (obj.type === 'user') return ''; // hit the human turn boundary → this turn had no preamble
-    if (obj.type !== 'assistant') continue;
-    const content = obj.message?.content;
-    if (!Array.isArray(content)) continue;
-    const texts = content.filter((b) => b?.type === 'text' && b.text).map((b) => b.text);
-    if (texts.length) return texts.join('\n\n');
-    // assistant tool_use/thinking line → keep walking within this turn
   }
   return '';
 }
@@ -436,12 +404,11 @@ async function runTool() {
   }
   if (payload?.tool_name !== 'AskUserQuestion') return;
 
-  let spoken = textFromAskUserQuestion(payload.tool_input, cfg);
+  // Only the question + options are available at PreToolUse. The assistant's preamble text isn't
+  // persisted anywhere a hook can read until AFTER the prompt is answered, so it can't be spoken
+  // alongside the prompt — it stays on screen to read.
+  const spoken = textFromAskUserQuestion(payload.tool_input, cfg);
   if (!spoken) return;
-  if (cfg.readPreamble !== false && payload.transcript_path) {
-    const preamble = currentTurnPreamble(payload.transcript_path);
-    if (preamble) spoken = `${preamble} ${spoken}`;
-  }
 
   const text = cleanForSpeech(spoken, cfg);
   if (!text || text.length < 2) return;
