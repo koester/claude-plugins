@@ -51,6 +51,7 @@ Speaking is **on by default** once installed. Control it with the `/yapper` comm
 |---|---|
 | `/yapper status` | Show current settings and whether the API key is detected |
 | `/yapper on` \| `off` \| `toggle` | Enable / disable speaking |
+| `/yapper stop` | Silence what's playing right now (Yapper stays enabled) |
 | `/yapper test [text]` | Speak a test phrase (verifies the API key + audio) |
 | `/yapper voices` | List the voices on your ElevenLabs account |
 | `/yapper voice <id\|name>` | Set the voice (by voice id or by name) |
@@ -65,6 +66,26 @@ The same CLI is runnable directly:
 node yapper/scripts/yapper.mjs status
 node yapper/scripts/yapper.mjs test "Hello there."
 ```
+
+## Interrupting playback
+
+Audio plays in a **detached** process (so it outlives the hook and never blocks your next
+prompt). A side effect: pressing **Ctrl-C in Claude Code won't stop it** — that keystroke goes to
+Claude, not to the detached player. Claude Code keybindings also can't run shell commands, so a
+key can't be bound directly to "stop yapper." Use one of these instead:
+
+- **`/yapper stop`** — silences whatever is playing immediately (Yapper stays enabled).
+- **Just start your next prompt** — the `UserPromptSubmit` hook stops playback the instant you
+  submit, so the previous answer stops reading as soon as you move on. Disable with
+  `"stopOnPrompt": false` in the config.
+- **A global OS hotkey** (optional) — bind this dependency-free one-liner to any system-wide
+  shortcut (Raycast, Karabiner, skhd, an Automator Quick Action, or a shell alias):
+
+  ```sh
+  kill "$(cat ~/.claude/yapper/current.pid 2>/dev/null)" 2>/dev/null
+  ```
+
+  It targets the stable pid file, so it keeps working across plugin updates.
 
 ## Configuration
 
@@ -81,6 +102,7 @@ plugin updates). Defaults:
   "similarityBoost": 0.75,
   "speed": 1.0,
   "interrupt": true,
+  "stopOnPrompt": true,
   "skipCodeBlocks": true,
   "outputFormat": "mp3_44100_128",
   "playerCmd": null,
@@ -96,6 +118,8 @@ plugin updates). Defaults:
   Set to `""` to auto-select the first voice on your account. Run `/yapper voices` to see options.
 - **`interrupt`** — when `true`, a new response stops the previous message's audio so they
   don't overlap.
+- **`stopOnPrompt`** — when `true`, submitting your next prompt immediately stops any playback
+  (see [Interrupting playback](#interrupting-playback)).
 - **`skipCodeBlocks`** — drops fenced code blocks entirely (reading code aloud is useless).
 - **`playerCmd` / `playerArgs`** — override the audio player, e.g. `"playerCmd": "mpg123"`,
   `"playerArgs": ["-q"]`.

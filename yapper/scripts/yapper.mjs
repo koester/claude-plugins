@@ -36,6 +36,7 @@ const DEFAULTS = {
   similarityBoost: 0.75,
   speed: 1.0, // 0.5–2.0; only sent to the API when != 1.0 for older-model compatibility
   interrupt: true, // stop the previous message's audio when a new one starts
+  stopOnPrompt: true, // stop any playing audio the moment you submit your next prompt
   skipCodeBlocks: true, // drop fenced code blocks entirely (reading code aloud is useless)
   outputFormat: 'mp3_44100_128',
   playerCmd: null, // override the audio player; default: afplay on macOS, ffplay elsewhere
@@ -417,6 +418,14 @@ async function runCli(argv) {
       if (!cfg.enabled) killCurrent();
       console.log(`Yapper ${cfg.enabled ? 'ON' : 'OFF'}`);
       break;
+    case 'stop':
+    case 'shush':
+    case 'quiet':
+    case 'hush':
+      // Silence whatever is playing right now, without disabling Yapper.
+      killCurrent();
+      console.log('playback stopped');
+      break;
     case 'test': {
       if (!apiKey(cfg)) {
         console.log('ELEVENLABS_API_KEY is not set.');
@@ -530,6 +539,7 @@ async function runCli(argv) {
       console.log('Usage: yapper <command>');
       console.log('  status              show current settings');
       console.log('  on | off | toggle   enable/disable speaking');
+      console.log('  stop                silence current playback (alias: shush)');
       console.log('  test [text]         speak a test phrase');
       console.log('  voices              list available ElevenLabs voices');
       console.log('  voice <id|name>     set the voice');
@@ -547,6 +557,14 @@ if (argv[0] === '--hook') {
   runHook().catch((e) => log(`hook error: ${e.message}`));
 } else if (argv[0] === '--worker') {
   runWorker(argv[1]).catch((e) => log(`worker error: ${e.message}`));
+} else if (argv[0] === '--interrupt') {
+  // UserPromptSubmit hook: silence playback the instant the user starts their next turn.
+  // Must write NOTHING to stdout — UserPromptSubmit stdout is injected into the prompt.
+  try {
+    if (loadConfig().stopOnPrompt !== false) killCurrent();
+  } catch (e) {
+    log(`interrupt error: ${e.message}`);
+  }
 } else {
   runCli(argv).catch((e) => {
     console.error(e.message);

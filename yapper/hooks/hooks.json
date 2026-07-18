@@ -11,6 +11,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/yapper.mjs\" --interrupt",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
