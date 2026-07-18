@@ -151,8 +151,9 @@ plugin updates). Defaults:
   prompt is on screen (the turn is mid-tool), so this reads the question and its options (plus the
   captured preamble, see below). Stays silent on stdout so it can't affect the prompt.
 - **`MessageDisplay`** → `--capture` — fires per displayed text chunk with a `delta` field;
-  accumulates the turn's assistant text into a buffer so the `PreToolUse` read can prefix it as the
-  preamble. Writes only to the buffer file; never speaks.
+  accumulates the turn's assistant text into a buffer. The `PreToolUse` read's detached worker then
+  prefixes it as the preamble — the worker waits for the (async) buffer to settle before reading, so
+  it captures the whole preamble without delaying the prompt. Writes only to the buffer; never speaks.
 - **`UserPromptSubmit`** → `--interrupt` — stops playback and resets the preamble buffer when you
   submit your next prompt.
 - The worker (`--worker`) calls the ElevenLabs `text-to-speech` endpoint, writes an MP3 to a

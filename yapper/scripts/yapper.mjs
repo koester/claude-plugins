@@ -269,6 +269,11 @@ async function resolveVoiceId(cfg, key) {
 }
 
 async function synthesizeAndPlay(text, cfg, epoch) {
+  // Debug aid: YAPPER_DRY=1 prints the final would-be-spoken text (incl. any prepended preamble).
+  if (process.env.YAPPER_DRY) {
+    process.stderr.write(`[yapper dry] ${text}\n`);
+    return;
+  }
   const key = apiKey(cfg);
   if (!key) {
     log('no API key — set ELEVENLABS_API_KEY or add "apiKey" to the config');
@@ -413,6 +418,34 @@ function clearPreambleBuffer() {
   }
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// The MessageDisplay --capture hooks write asynchronously and can lag; wait briefly for the buffer
+// to stop growing so we read the whole preamble, not a partial/empty one. Runs in the detached
+// worker (after the prompt is already on screen), so it never delays the prompt.
+async function waitForBufferStable(maxMs = 600, stepMs = 60) {
+  const start = Date.now();
+  let last = -1;
+  let stable = 0;
+  while (Date.now() - start < maxMs) {
+    let size = 0;
+    try {
+      size = fs.statSync(BUFFER_PATH).size;
+    } catch {
+      size = 0;
+    }
+    if (size === last) {
+      if (++stable >= 2 && size > 0) return;
+    } else {
+      stable = 0;
+      last = size;
+    }
+    await sleep(stepMs);
+  }
+}
+
 // ---------- read ordering (epoch) + chunking ----------
 
 // Stamp a new "latest read" token. Older workers see a different value and stop.
@@ -454,9 +487,10 @@ function chunkText(text, limit) {
 }
 
 // Hand text to a detached worker and return immediately so the hook never blocks the session.
-function stageAndSpawn(text, cfg) {
-  // Debug aid: YAPPER_DRY=1 prints the would-be-spoken text to stderr and skips audio.
-  if (process.env.YAPPER_DRY) {
+function stageAndSpawn(text, cfg, opts = {}) {
+  // When prepending the preamble, the worker resolves it (with a buffer-stable wait) — so a dry run
+  // of the hook can't show it here; dry-run the worker directly to see the combined text.
+  if (process.env.YAPPER_DRY && !opts.prependPreamble) {
     process.stderr.write(`[yapper dry] ${text}\n`);
     return;
   }
@@ -472,7 +506,7 @@ function stageAndSpawn(text, cfg) {
   }
   const child = spawn(
     process.execPath,
-    [fileURLToPath(import.meta.url), '--worker', textFile, epoch],
+    [fileURLToPath(import.meta.url), '--worker', textFile, epoch, opts.prependPreamble ? '1' : '0'],
     { detached: true, stdio: 'ignore' },
   );
   child.unref();
@@ -492,31 +526,18 @@ async function runTool() {
   }
   if (payload?.tool_name !== 'AskUserQuestion') return;
 
-  let spoken = textFromAskUserQuestion(payload.tool_input, cfg);
-  if (!spoken) {
+  const text = cleanForSpeech(textFromAskUserQuestion(payload.tool_input, cfg), cfg);
+  if (!text || text.length < 2) {
     clearPreambleBuffer();
     return;
   }
 
-  // Prepend the assistant text shown just before the prompt — captured live by the MessageDisplay
-  // hook (it isn't in the PreToolUse payload or the transcript yet). Cap the preamble so a long one
-  // doesn't crowd out the options.
-  if (cfg.readPreamble !== false) {
-    const pre = cleanForSpeech(readPreambleBuffer(), cfg);
-    if (pre) {
-      const cap = Math.max(200, (cfg.maxChars || 1000) - 300);
-      spoken = `${pre.length > cap ? pre.slice(0, cap) : pre} ${spoken}`;
-    }
-  }
-  clearPreambleBuffer();
-
-  const text = cleanForSpeech(spoken, cfg);
-  if (!text || text.length < 2) return;
-
-  stageAndSpawn(text, cfg);
+  // Return fast so the prompt isn't delayed; the worker prepends the MessageDisplay-captured
+  // preamble (after waiting for it to settle) and speaks it.
+  stageAndSpawn(text, cfg, { prependPreamble: cfg.readPreamble !== false });
 }
 
-async function runWorker(textFile, epoch) {
+async function runWorker(textFile, epoch, prependPreamble) {
   const cfg = loadConfig();
   let text = '';
   try {
@@ -529,7 +550,21 @@ async function runWorker(textFile, epoch) {
   } catch {
     /* ignore */
   }
-  if (text) await synthesizeAndPlay(text, cfg, epoch);
+  if (!text) return;
+
+  // Prefix the preamble captured live by MessageDisplay. Reading it here (not in the PreToolUse
+  // hook) lets us wait for the async capture to settle without delaying the prompt.
+  if (prependPreamble === '1' && cfg.readPreamble !== false) {
+    await waitForBufferStable();
+    const pre = cleanForSpeech(readPreambleBuffer(), cfg);
+    clearPreambleBuffer();
+    if (pre) {
+      const cap = Math.max(200, (cfg.maxChars || 1000) - 300); // leave room for the options
+      text = `${pre.length > cap ? pre.slice(0, cap) : pre} ${text}`;
+    }
+  }
+
+  await synthesizeAndPlay(text, cfg, epoch);
 }
 
 async function runCli(argv) {
@@ -718,7 +753,7 @@ if (argv[0] === '--hook') {
     .catch((e) => log(`hook error: ${e.message}`))
     .finally(() => clearPreambleBuffer());
 } else if (argv[0] === '--worker') {
-  runWorker(argv[1], argv[2]).catch((e) => log(`worker error: ${e.message}`));
+  runWorker(argv[1], argv[2], argv[3]).catch((e) => log(`worker error: ${e.message}`));
 } else if (argv[0] === '--tool') {
   runTool().catch((e) => log(`tool hook error: ${e.message}`));
 } else if (argv[0] === '--interrupt') {
