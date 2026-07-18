@@ -5,6 +5,5 @@
   "author": {
     "name": "Kevin Koester"
   },
-  "keywords": ["tts", "voice", "elevenlabs", "accessibility", "audio"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["tts", "voice", "elevenlabs", "accessibility", "audio"]
 }
