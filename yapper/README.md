@@ -1,0 +1,125 @@
+# Yapper
+
+Reads Claude Code's completed responses aloud using [ElevenLabs](https://elevenlabs.io) text-to-speech.
+
+When Claude finishes a response, Yapper's `Stop` hook grabs the final message, strips the
+markdown/code down to something that sounds natural, sends it to ElevenLabs, and plays the
+audio — without blocking your next prompt.
+
+## Requirements
+
+- **An ElevenLabs API key** (from <https://elevenlabs.io/app/settings/api-keys>). Provide it either way:
+  - Set `apiKey` in `~/.claude/yapper/config.json`, **or**
+  - Export `ELEVENLABS_API_KEY` (or `XI_API_KEY`) in the environment Claude Code runs in.
+
+  If both are present, the config `apiKey` wins — an explicit config choice beats whatever might
+  be lingering in the environment.
+- **Node.js 18+** (uses the built-in `fetch`; no npm dependencies).
+- An audio player: **`afplay`** on macOS (built in). On Linux, `ffplay` by default — override
+  with `playerCmd` in the config (see below).
+
+## Install
+
+Yapper ships in the [`koester/claude-plugins`](https://github.com/koester/claude-plugins)
+marketplace. From inside Claude Code:
+
+```
+/plugin marketplace add koester/claude-plugins
+/plugin install yapper@koester-plugins
+```
+
+Then restart Claude Code (or reload plugins) so the `Stop` hook registers.
+
+<details>
+<summary>Install from a local checkout (development)</summary>
+
+```
+git clone https://github.com/koester/claude-plugins
+/plugin marketplace add /path/to/claude-plugins
+/plugin install yapper@koester-plugins
+```
+
+</details>
+
+Once installed, configure your API key (see below) and you're set — speaking is on by default.
+
+## Usage
+
+Speaking is **on by default** once installed. Control it with the `/yapper` command:
+
+| Command | Effect |
+|---|---|
+| `/yapper status` | Show current settings and whether the API key is detected |
+| `/yapper on` \| `off` \| `toggle` | Enable / disable speaking |
+| `/yapper test [text]` | Speak a test phrase (verifies the API key + audio) |
+| `/yapper voices` | List the voices on your ElevenLabs account |
+| `/yapper voice <id\|name>` | Set the voice (by voice id or by name) |
+| `/yapper model <id>` | Set the model (default `eleven_flash_v2_5`) |
+| `/yapper maxchars <n>` | Cap characters spoken per message (default 1000) |
+| `/yapper speed <0.5-2.0>` | Set speaking speed |
+| `/yapper preview <transcript.jsonl>` | Print what *would* be spoken — no API call (debug) |
+
+The same CLI is runnable directly:
+
+```
+node yapper/scripts/yapper.mjs status
+node yapper/scripts/yapper.mjs test "Hello there."
+```
+
+## Configuration
+
+Settings persist to `~/.claude/yapper/config.json` (outside the plugin dir, so they survive
+plugin updates). Defaults:
+
+```json
+{
+  "enabled": true,
+  "voiceId": "nPczCjzI2devNBz1zQrb",
+  "modelId": "eleven_flash_v2_5",
+  "maxChars": 1000,
+  "stability": 0.5,
+  "similarityBoost": 0.75,
+  "speed": 1.0,
+  "interrupt": true,
+  "skipCodeBlocks": true,
+  "outputFormat": "mp3_44100_128",
+  "playerCmd": null,
+  "playerArgs": null,
+  "apiKey": ""
+}
+```
+
+- **`voiceId`** — defaults to **Brian** (`nPczCjzI2devNBz1zQrb`), a free premade voice available
+  on every account. Swap it for any voice id or name with `/yapper voice <id|name>`, or by editing
+  this field directly. Library/cloned voices work too **if your ElevenLabs plan/key is allowed to
+  use them** (library voices require a paid plan — a free account gets a `402` and stays silent).
+  Set to `""` to auto-select the first voice on your account. Run `/yapper voices` to see options.
+- **`interrupt`** — when `true`, a new response stops the previous message's audio so they
+  don't overlap.
+- **`skipCodeBlocks`** — drops fenced code blocks entirely (reading code aloud is useless).
+- **`playerCmd` / `playerArgs`** — override the audio player, e.g. `"playerCmd": "mpg123"`,
+  `"playerArgs": ["-q"]`.
+
+## How it works
+
+- `hooks/hooks.json` registers a **`Stop`** hook → `node scripts/yapper.mjs --hook`.
+- `--hook` reads the hook payload from stdin. It uses `last_assistant_message` if present,
+  otherwise parses the last assistant text block out of the transcript JSONL. It strips
+  markdown, then spawns a **detached worker** and exits immediately (the hook never blocks).
+- The worker (`--worker`) calls the ElevenLabs `text-to-speech` endpoint, writes an MP3 to a
+  temp file, and plays it. It records the player PID so the next response can interrupt it.
+- All failures are **soft**: missing/invalid key, network errors, or no audio player are logged
+  to `~/.claude/yapper/yapper.log` and the hook still exits 0. Yapper never breaks your session.
+
+## Troubleshooting
+
+- **No sound, `/yapper status` says API key MISSING** — set `apiKey` in
+  `~/.claude/yapper/config.json`, or export `ELEVENLABS_API_KEY` in the shell you launch Claude
+  Code from and restart it.
+- **`/yapper test` says nothing / log shows `401`** — the key is invalid, expired, or revoked.
+  Generate a fresh one at <https://elevenlabs.io/app/settings/api-keys>. Verify with:
+  `curl -s -o /dev/null -w "%{http_code}\n" -H "xi-api-key: <your-key>" https://api.elevenlabs.io/v1/voices`
+  (should print `200`).
+- **Log shows `402` / a voice stays silent** — that voice needs a paid plan (library/cloned
+  voices do). Pick a free premade voice with `/yapper voices` + `/yapper voice <id>`, or upgrade.
+- **Check the log** — `~/.claude/yapper/yapper.log` records why a message wasn't spoken.

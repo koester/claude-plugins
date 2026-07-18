@@ -1,0 +1,10 @@
+{
+  "name": "yapper",
+  "version": "0.1.0",
+  "description": "Reads Claude's completed responses aloud using ElevenLabs text-to-speech.",
+  "author": {
+    "name": "Kevin Koester"
+  },
+  "keywords": ["tts", "voice", "elevenlabs", "accessibility", "audio"],
+  "hooks": "./hooks/hooks.json"
+}

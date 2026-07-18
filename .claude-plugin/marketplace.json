@@ -1,0 +1,13 @@
+{
+  "name": "koester-plugins",
+  "owner": {
+    "name": "Kevin Koester"
+  },
+  "plugins": [
+    {
+      "name": "yapper",
+      "source": "./yapper",
+      "description": "Reads Claude's completed responses aloud using ElevenLabs text-to-speech."
+    }
+  ]
+}
