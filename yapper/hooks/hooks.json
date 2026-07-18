@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/yapper.mjs\" --tool",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "matcher": "",

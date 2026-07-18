@@ -37,6 +37,9 @@ const DEFAULTS = {
   speed: 1.0, // 0.5–2.0; only sent to the API when != 1.0 for older-model compatibility
   interrupt: true, // stop the previous message's audio when a new one starts
   stopOnPrompt: true, // stop any playing audio the moment you submit your next prompt
+  readOptions: true, // read AskUserQuestion prompts (question + options) aloud — Stop won't fire for those
+  readOptionDescriptions: true, // include each option's description, not only its label
+  readPreamble: true, // also read the assistant text shown just before the prompt
   skipCodeBlocks: true, // drop fenced code blocks entirely (reading code aloud is useless)
   outputFormat: 'mp3_44100_128',
   playerCmd: null, // override the audio player; default: afplay on macOS, ffplay elsewhere
@@ -107,6 +110,60 @@ function extractLastAssistantText(transcriptPath) {
     // assistant line with only tool_use/thinking → keep looking further back in the turn
   }
   return '';
+}
+
+// Walk the transcript backwards for the assistant text of the CURRENT turn only — the text shown
+// just before a tool call. Stops at the human-message boundary so it never reaches a prior turn
+// (returns '' when the assistant called the tool with no preceding text).
+function currentTurnPreamble(transcriptPath) {
+  let data;
+  try {
+    data = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return '';
+  }
+  const lines = data.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (obj.type === 'user') return ''; // hit the human turn boundary → this turn had no preamble
+    if (obj.type !== 'assistant') continue;
+    const content = obj.message?.content;
+    if (!Array.isArray(content)) continue;
+    const texts = content.filter((b) => b?.type === 'text' && b.text).map((b) => b.text);
+    if (texts.length) return texts.join('\n\n');
+    // assistant tool_use/thinking line → keep walking within this turn
+  }
+  return '';
+}
+
+// Turn an AskUserQuestion tool_input into a natural spoken script of the question(s) and options.
+function textFromAskUserQuestion(toolInput, cfg) {
+  const questions = Array.isArray(toolInput?.questions) ? toolInput.questions : [];
+  if (!questions.length) return '';
+  const parts = [];
+  const multi = questions.length > 1;
+  questions.forEach((q, qi) => {
+    if (multi) parts.push(`Question ${qi + 1}.`);
+    if (q.question) parts.push(q.question);
+    const opts = Array.isArray(q.options) ? q.options : [];
+    if (opts.length) {
+      parts.push('Your options are:');
+      const trim = (v) => String(v).replace(/[.!?]+$/, ''); // avoid doubled sentence punctuation
+      opts.forEach((o, oi) => {
+        let s = `${oi + 1}. ${trim(o.label)}.`;
+        if (cfg.readOptionDescriptions !== false && o.description) s += ` ${trim(o.description)}.`;
+        parts.push(s);
+      });
+    }
+  });
+  return parts.join(' ');
 }
 
 // Strip markdown down to something that sounds natural when spoken.
@@ -340,8 +397,16 @@ async function runHook() {
   if (!text || text.length < 2) return;
 
   if (cfg.interrupt) killCurrent();
+  stageAndSpawn(text);
+}
 
-  // Hand the text to a detached worker and return immediately so the hook never blocks.
+// Hand text to a detached worker and return immediately so the hook never blocks the session.
+function stageAndSpawn(text) {
+  // Debug aid: YAPPER_DRY=1 prints the would-be-spoken text to stderr and skips audio.
+  if (process.env.YAPPER_DRY) {
+    process.stderr.write(`[yapper dry] ${text}\n`);
+    return;
+  }
   ensureDir();
   const textFile = path.join(DIR, `pending-${process.pid}-${Date.now()}.txt`);
   try {
@@ -355,6 +420,34 @@ async function runHook() {
     stdio: 'ignore',
   });
   child.unref();
+}
+
+// PreToolUse(AskUserQuestion) hook: Stop never fires for a question prompt (the turn is mid-tool),
+// so read the question + its options — and the assistant text shown just before it — aloud here.
+async function runTool() {
+  const cfg = loadConfig();
+  if (!cfg.enabled || cfg.readOptions === false) return;
+
+  let payload = null;
+  try {
+    payload = JSON.parse(await readStdin());
+  } catch {
+    /* no/invalid payload */
+  }
+  if (payload?.tool_name !== 'AskUserQuestion') return;
+
+  let spoken = textFromAskUserQuestion(payload.tool_input, cfg);
+  if (!spoken) return;
+  if (cfg.readPreamble !== false && payload.transcript_path) {
+    const preamble = currentTurnPreamble(payload.transcript_path);
+    if (preamble) spoken = `${preamble} ${spoken}`;
+  }
+
+  const text = cleanForSpeech(spoken, cfg);
+  if (!text || text.length < 2) return;
+
+  if (cfg.interrupt) killCurrent();
+  stageAndSpawn(text);
 }
 
 async function runWorker(textFile) {
@@ -557,6 +650,8 @@ if (argv[0] === '--hook') {
   runHook().catch((e) => log(`hook error: ${e.message}`));
 } else if (argv[0] === '--worker') {
   runWorker(argv[1]).catch((e) => log(`worker error: ${e.message}`));
+} else if (argv[0] === '--tool') {
+  runTool().catch((e) => log(`tool hook error: ${e.message}`));
 } else if (argv[0] === '--interrupt') {
   // UserPromptSubmit hook: silence playback the instant the user starts their next turn.
   // Must write NOTHING to stdout — UserPromptSubmit stdout is injected into the prompt.

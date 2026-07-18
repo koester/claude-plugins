@@ -103,6 +103,9 @@ plugin updates). Defaults:
   "speed": 1.0,
   "interrupt": true,
   "stopOnPrompt": true,
+  "readOptions": true,
+  "readOptionDescriptions": true,
+  "readPreamble": true,
   "skipCodeBlocks": true,
   "outputFormat": "mp3_44100_128",
   "playerCmd": null,
@@ -120,16 +123,26 @@ plugin updates). Defaults:
   don't overlap.
 - **`stopOnPrompt`** — when `true`, submitting your next prompt immediately stops any playback
   (see [Interrupting playback](#interrupting-playback)).
+- **`readOptions`** — when `true`, also reads **question prompts** aloud (Claude's
+  `AskUserQuestion` — the "pick an option" prompts). The `Stop` hook can't cover these because the
+  turn is still mid-tool, so a `PreToolUse` hook reads the question and its options as they appear.
+  - **`readOptionDescriptions`** — include each option's description, not only its label.
+  - **`readPreamble`** — also read the assistant text shown just before the prompt.
 - **`skipCodeBlocks`** — drops fenced code blocks entirely (reading code aloud is useless).
 - **`playerCmd` / `playerArgs`** — override the audio player, e.g. `"playerCmd": "mpg123"`,
   `"playerArgs": ["-q"]`.
 
 ## How it works
 
-- `hooks/hooks.json` registers a **`Stop`** hook → `node scripts/yapper.mjs --hook`.
-- `--hook` reads the hook payload from stdin. It uses `last_assistant_message` if present,
-  otherwise parses the last assistant text block out of the transcript JSONL. It strips
-  markdown, then spawns a **detached worker** and exits immediately (the hook never blocks).
+`hooks/hooks.json` registers three hooks, all pointing at `scripts/yapper.mjs`:
+
+- **`Stop`** → `--hook` — the main path: reads the hook payload from stdin (uses
+  `last_assistant_message` if present, otherwise the last assistant text block from the transcript
+  JSONL), strips markdown, then spawns a **detached worker** and exits immediately (never blocks).
+- **`PreToolUse`** (matcher `AskUserQuestion`) → `--tool` — `Stop` doesn't fire while a question
+  prompt is on screen (the turn is mid-tool), so this reads the question, its options, and the
+  preamble text as they appear. Stays silent on stdout so it can't affect the prompt.
+- **`UserPromptSubmit`** → `--interrupt` — stops playback the moment you submit your next prompt.
 - The worker (`--worker`) calls the ElevenLabs `text-to-speech` endpoint, writes an MP3 to a
   temp file, and plays it. It records the player PID so the next response can interrupt it.
 - All failures are **soft**: missing/invalid key, network errors, or no audio player are logged

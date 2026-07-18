@@ -1,6 +1,6 @@
 {
   "name": "yapper",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reads Claude's completed responses aloud using ElevenLabs text-to-speech.",
   "author": {
     "name": "Kevin Koester"
